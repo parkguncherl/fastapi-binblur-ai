@@ -50,7 +50,7 @@ def scrape_naver_shopping(url):
         unique_urls = set()
         last_height = driver.execute_script("return document.body.scrollHeight")
         scroll_attempts = 0
-        max_attempts = 20
+        max_attempts = 3
 
         while scroll_attempts < max_attempts:
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
@@ -64,7 +64,7 @@ def scrape_naver_shopping(url):
                 items = driver.find_elements(By.CSS_SELECTOR, ".diplsayCategoryProductCard_thumbnail__rC7n3 > img")
             except StaleElementReferenceException:
                 logger.warning("Stale element detected, retrying...")
-                time.sleep(2)
+                time.sleep(3)
                 items = driver.find_elements(By.CSS_SELECTOR, ".diplsayCategoryProductCard_thumbnail__rC7n3 > img")
 
             # 고유 URL 수집
