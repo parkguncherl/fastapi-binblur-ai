@@ -1,7 +1,7 @@
 import requests
 from bs4 import BeautifulSoup
 import psycopg2
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
@@ -12,6 +12,13 @@ from selenium.common.exceptions import StaleElementReferenceException
 from datetime import date
 import logging
 import time
+import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
+from PIL import Image
+import io
+import numpy as np
+from typing import Dict
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,6 +34,40 @@ DB_PARAMS = {
 }
 
 TARGET_URL = "https://shopping.naver.com/window/fashion-group/category/20006056?sort=BRAND_POPULARITY"
+
+# CNN 모델 정의
+class PricePredictor(nn.Module):
+    def __init__(self):
+        super(PricePredictor, self).__init__()
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2)
+        )
+        self.fc_layers = nn.Sequential(
+            nn.Linear(64 * 28 * 28, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, x):
+        x = self.conv_layers(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc_layers(x)
+        return x
+
+# 이미지 전처리
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
 
 def get_db_connection():
     try:
@@ -46,7 +87,6 @@ def scrape_naver_shopping(url):
         driver.get(url)
         logger.info("Page loaded with Selenium")
 
-        # 스크롤을 통해 모든 상품 로드
         unique_urls = set()
         last_height = driver.execute_script("return document.body.scrollHeight")
         scroll_attempts = 0
@@ -54,9 +94,8 @@ def scrape_naver_shopping(url):
 
         while scroll_attempts < max_attempts:
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(5)  # 콘텐츠 로드 대기
+            time.sleep(5)
 
-            # 상품 요소가 로드될 때까지 대기
             try:
                 WebDriverWait(driver, 10).until(
                     EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".diplsayCategoryProductCard_thumbnail__rC7n3 > img"))
@@ -67,7 +106,6 @@ def scrape_naver_shopping(url):
                 time.sleep(3)
                 items = driver.find_elements(By.CSS_SELECTOR, ".diplsayCategoryProductCard_thumbnail__rC7n3 > img")
 
-            # 고유 URL 수집
             for item in items:
                 try:
                     img_url = item.get_attribute("data-src") or item.get_attribute("src")
@@ -89,7 +127,6 @@ def scrape_naver_shopping(url):
                 scroll_attempts = 0
             last_height = new_height
 
-        # 모든 상품 추출
         soup = BeautifulSoup(driver.page_source, "html.parser")
         driver.quit()
 
@@ -144,7 +181,7 @@ def check_existing_image_url(conn, image_url):
     cur = conn.cursor()
     try:
         cur.execute(
-            "SELECT COUNT(*) FROM TB_AI_DATA WHERE image_url = %s",
+            "SELECT COUNT(*) FROM public.tb_ai_data WHERE image_url = %s",
             (image_url,)
         )
         count = cur.fetchone()[0]
@@ -171,7 +208,7 @@ def insert_into_db(products):
             if image_data:
                 cur.execute(
                     """
-                    INSERT INTO TB_AI_DATA (image, prod_desc, price, retail_type, cre_tm, image_url)
+                    INSERT INTO public.tb_ai_data (image, prod_desc, price, retail_type, cre_tm, image_url)
                     VALUES (%s, %s, %s, %s, %s, %s)
                     """,
                     (psycopg2.Binary(image_data), product["description"], product["price"], "O", today, product["image_url"])
@@ -199,6 +236,119 @@ async def scrape_and_store():
         return {"message": f"Successfully processed {len(products)} products, inserted {inserted_count} new records"}
     else:
         return {"message": "No products found or scraping failed"}
+
+@app.post("/api/train")
+async def train_model() -> Dict[str, str]:
+    try:
+        # 모델 초기화
+        model = PricePredictor()
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+        # retail_type 'O' 데이터 가져오기
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT image, price 
+            FROM public.tb_ai_data 
+            WHERE retail_type = 'O' AND image IS NOT NULL AND price IS NOT NULL
+        """)
+        training_data = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        if not training_data:
+            raise HTTPException(status_code=400, detail="훈련 데이터가 없습니다")
+
+        # 데이터 준비
+        images = []
+        prices = []
+        for img_data, price in training_data:
+            try:
+                img = Image.open(io.BytesIO(img_data)).convert('RGB')  # RGB로 변환
+                img_tensor = transform(img)
+                images.append(img_tensor)
+                prices.append(float(price))
+            except Exception as e:
+                logger.warning(f"Failed to process image: {e}")
+                continue
+
+        if not images:
+            raise HTTPException(status_code=400, detail="유효한 이미지 데이터가 없습니다")
+
+        images = torch.stack(images)
+        prices = torch.tensor(prices).float().unsqueeze(1)
+
+        # 모델 훈련
+        model.train()
+        for epoch in range(10):
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, prices)
+            loss.backward()
+            optimizer.step()
+            logger.info(f"Epoch {epoch + 1}, Loss: {loss.item()}")
+
+        # 모델 저장
+        torch.save(model.state_dict(), 'price_predictor.pth')
+        return {"message": "모델 훈련이 성공적으로 완료되었습니다"}
+
+    except Exception as e:
+        logger.error(f"Training failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/predict")
+async def predict_prices() -> Dict[str, str]:
+    try:
+        # 모델 로드
+        model = PricePredictor()
+        model.load_state_dict(torch.load('price_predictor.pth'))
+        model.eval()
+
+        # retail_type 'P' 데이터 가져오기
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, image 
+            FROM public.tb_ai_data 
+            WHERE retail_type = 'P' AND image IS NOT NULL
+        """)
+        prediction_data = cur.fetchall()
+
+        if not prediction_data:
+            cur.close()
+            conn.close()
+            raise HTTPException(status_code=400, detail="예측 데이터가 없습니다")
+
+        # 예측 수행
+        updated_count = 0
+        with torch.no_grad():
+            for id, img_data in prediction_data:
+                try:
+                    img = Image.open(io.BytesIO(img_data)).convert('RGB')  # RGB로 변환
+                    img_tensor = transform(img).unsqueeze(0)
+                    prediction = model(img_tensor)
+                    predicted_price = int(prediction.item())
+
+                    cur.execute("""
+                        UPDATE public.tb_ai_data 
+                        SET predict_price = %s 
+                        WHERE id = %s
+                    """, (predicted_price, id))
+                    updated_count += 1
+                except Exception as e:
+                    logger.warning(f"Failed to predict for id {id}: {e}")
+                    continue
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return {"message": f"예측이 성공적으로 완료되었습니다. {updated_count}개의 레코드가 업데이트됨"}
+
+    except Exception as e:
+        logger.error(f"Prediction failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
