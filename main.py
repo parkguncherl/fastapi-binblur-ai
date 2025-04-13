@@ -94,7 +94,7 @@ def scrape_naver_shopping(url):
 
         while scroll_attempts < max_attempts:
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(5)
+            time.sleep(3)
 
             try:
                 WebDriverWait(driver, 10).until(
@@ -181,7 +181,7 @@ def check_existing_image_url(conn, image_url):
     cur = conn.cursor()
     try:
         cur.execute(
-            "SELECT COUNT(*) FROM public.tb_ai_data WHERE image_url = %s",
+            "SELECT COUNT(*) FROM tb_ai_data WHERE image_url = %s",
             (image_url,)
         )
         count = cur.fetchone()[0]
